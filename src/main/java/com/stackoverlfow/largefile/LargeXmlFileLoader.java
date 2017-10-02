@@ -5,8 +5,7 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
 
-import javax.xml.parsers.ParserConfigurationException;
-
+import org.apache.poi.POIXMLTypeLoader;
 import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
 import org.apache.poi.openxml4j.exceptions.InvalidOperationException;
 import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
@@ -18,14 +17,21 @@ import org.apache.poi.xssf.eventusermodel.ReadOnlySharedStringsTable;
 import org.apache.poi.xssf.eventusermodel.XSSFReader;
 import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler;
 import org.apache.poi.xssf.model.StylesTable;
+import org.apache.xmlbeans.XmlFactoryHook;
+import org.apache.xmlbeans.XmlOptions;
 import org.xml.sax.ContentHandler;
 import org.xml.sax.InputSource;
 import org.xml.sax.SAXException;
 import org.xml.sax.XMLReader;
 
+import com.ctc.wstx.sax.WstxSAXParser;
+
 public class LargeXmlFileLoader {
 
     private String filepath;
+
+    private boolean hookEnabled = false;
+    private boolean useWstxParse = true;
 
     public LargeXmlFileLoader(String filepath) {
         this.filepath = filepath;
@@ -57,8 +63,31 @@ public class LargeXmlFileLoader {
     }
 
     private void process0(RecordHandler recordHandler) throws IOException, SAXException, OpenXML4JException {
+        POIXMLTypeLoader.DEFAULT_XML_OPTIONS.put(XmlOptions.UNSYNCHRONIZED, true);
         try (OPCPackage xlsxPackage = open()) {
-            ReadOnlySharedStringsTable strings = new ReadOnlySharedStringsTable(xlsxPackage);
+
+            XmlFactoryHook remember = null;
+            if (hookEnabled) {
+                remember = XmlFactoryHook.ThreadContext.getHook();
+                XmlFactoryHook.ThreadContext.setHook(new CachableXmlFactoryHook());
+            }
+            ReadOnlySharedStringsTable strings = new ReadOnlySharedStringsTable(xlsxPackage) {
+                @Override
+                public void readFrom(InputStream is) throws IOException, SAXException {
+                    if (useWstxParse) {
+                        InputSource sheetSource = new InputSource(is);
+                        try {
+                            XMLReader sheetParser = new WstxSAXParser();
+                            sheetParser.setContentHandler(this);
+                            sheetParser.parse(sheetSource);
+                        } catch (Exception e) {
+                            throw new RuntimeException("SAX parser appears to be broken - " + e.getMessage());
+                        }
+                    }else {
+                        super.readFrom(is);
+                    }
+                }
+            };
 
             XSSFReader xssfReader = new XSSFReader(xlsxPackage);
             StylesTable styles = xssfReader.getStylesTable();
@@ -70,6 +99,10 @@ public class LargeXmlFileLoader {
                 processSheet(styles, strings, handlerImpl, stream);
                 stream.close();
             }
+
+            if (hookEnabled) {
+                XmlFactoryHook.ThreadContext.setHook(remember);
+            }
         }
     }
 
@@ -77,8 +110,14 @@ public class LargeXmlFileLoader {
             InputStream stream) throws SAXException, IOException {
         DataFormatter formatter = new DataFormatter();
         InputSource sheetSource = new InputSource(stream);
+        XmlFactoryHook remember = null;
+        if (hookEnabled) {
+            remember = XmlFactoryHook.ThreadContext.getHook();
+            XmlFactoryHook.ThreadContext.setHook(new CachableXmlFactoryHook());
+        }
+
         try {
-            XMLReader sheetParser = SAXHelper.newXMLReader();
+            XMLReader sheetParser = useWstxParse  ? new WstxSAXParser() : SAXHelper.newXMLReader();
             ContentHandler handler = new XSSFSheetXMLHandler(
                     styles,
                     null,
@@ -87,9 +126,14 @@ public class LargeXmlFileLoader {
                     formatter,
                     false);
             sheetParser.setContentHandler(handler);
+
             sheetParser.parse(sheetSource);
-        } catch (ParserConfigurationException e) {
+        } catch (Exception e) {
             throw new RuntimeException("SAX parser appears to be broken - " + e.getMessage());
+        } finally {
+            if (hookEnabled) {
+                XmlFactoryHook.ThreadContext.setHook(remember);
+            }
         }
 
     }
